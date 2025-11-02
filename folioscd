@@ -1,0 +1,192 @@
+# app.py
+# Streamlit — Escaneo de PDFs en carpeta de Google Drive
+# Extrae (1) el número que viene después de "Venta DM ..." y (2) el FOLIO,
+# y permite descargar un Excel con los resultados.
+
+import os
+import io
+import re
+import tempfile
+from typing import List, Tuple, Dict
+
+import pandas as pd
+import streamlit as st
+from unidecode import unidecode
+
+from pdfminer.high_level import extract_text
+from pydrive2.auth import GoogleAuth
+from pydrive2.drive import GoogleDrive
+
+st.set_page_config(page_title="Escáner PDFs (Drive) — Venta DM + FOLIO", page_icon="📄", layout="wide")
+
+st.title("📄 Escáner de PDFs en Google Drive → Venta DM & FOLIO")
+st.caption("Pega la URL o el ID de la carpeta de Google Drive, escanea los PDFs que contiene, y descarga un Excel.")
+
+with st.expander("⚙️ Instrucciones rápidas", expanded=False):
+    st.markdown(
+        "**Necesitas activar la Google Drive API** y tener un archivo **`client_secrets.json`** (OAuth) junto al script.\n"- Una vez listo, pega la **URL** o **ID** de la carpeta de Google Drive que contiene los PDFs.\n        "- El escáner **saltará** PDFs que **no contengan** la frase *\"Venta DM\"*.\n"- Se buscan dos valores:\n        "  1) **Venta DM** → el número después de *Venta DM* (ej.: `Venta DM Mercado libre- 2000009423095799` → `2000009423095799`).\n"  2) **FOLIO** → el número (o texto) después de `FOLIO :` o `FOLIO:`.\n        "- Al final podrás **descargar un Excel** con columnas: archivo, venta_dm, folio."
+    )
+
+VENTA_DM_REGEXES = [
+    r"venta\s*dm[^\d]{0,30}[-:]\s*([0-9]{6,})",
+    r"venta\s*dm[^\d]{0,30}\s+([0-9]{6,})",
+]
+
+FOLIO_REGEXES = [
+    r"folio\s*[:\-]\s*([A-Z0-9\-\/]{3,})",
+    r"\bfolio\b\s+([A-Z0-9\-\/]{3,})",
+]
+
+def normalize_text(txt: str) -> str:
+    t = unidecode(txt or "")
+    t = re.sub(r"[ \t]+", " ", t)
+    return t
+
+def extract_fields_from_text(text: str) -> Tuple[str, str]:
+    t = normalize_text(text).lower()
+    venta_dm = ""
+    folio = ""
+    for pat in VENTA_DM_REGEXES:
+        m = re.search(pat, t, flags=re.IGNORECASE | re.DOTALL)
+        if m:
+            venta_dm = m.group(1).strip()
+            break
+    for pat in FOLIO_REGEXES:
+        m = re.search(pat, t, flags=re.IGNORECASE | re.DOTALL)
+        if m:
+            folio = m.group(1).strip().strip(".;,")
+            break
+    return venta_dm, folio
+
+def parse_folder_id_from_input(folder_input: str) -> str:
+    s = (folder_input or "").strip()
+    if not s:
+        return ""
+    import re as _re
+    m = _re.search(r"/folders/([a-zA-Z0-9_\-]{10,})", s)
+    if m:
+        return m.group(1)
+    m = _re.search(r"[?&]id=([a-zA-Z0-9_\-]{10,})", s)
+    if m:
+        return m.group(1)
+    return s
+
+def gauth_login() -> GoogleDrive:
+    gauth = GoogleAuth()
+    gauth.LoadCredentialsFile("credentials.json")
+    if gauth.credentials is None:
+        gauth.LocalWebserverAuth()
+    elif gauth.access_token_expired:
+        gauth.Refresh()
+    else:
+        gauth.Authorize()
+    gauth.SaveCredentialsFile("credentials.json")
+    return GoogleDrive(gauth)
+
+def list_pdfs_in_folder(drive: GoogleDrive, folder_id: str):
+    query = f"'{folder_id}' in parents and mimeType = 'application/pdf' and trashed = false"
+    file_list = drive.ListFile({'q': query}).GetList()
+    return [{"id": f['id'], "title": f['title']} for f in file_list]
+
+def download_pdf_to_temp(drive: GoogleDrive, file_id: str) -> str:
+    f = drive.CreateFile({'id': file_id})
+    fd, tmp_path = tempfile.mkstemp(suffix=".pdf")
+    os.close(fd)
+    f.GetContentFile(tmp_path)
+    return tmp_path
+
+def extract_text_from_pdf_file(path: str) -> str:
+    try:
+        return extract_text(path) or ""
+    except Exception:
+        return ""
+
+tab1, tab2 = st.tabs(["🔎 Escanear carpeta de Drive", "📤 (Opcional) Subir PDFs manualmente"])
+
+with tab1:
+    folder_input = st.text_input("Pega aquí la **URL** o el **ID** de la carpeta en Google Drive:", placeholder="https://drive.google.com/drive/folders/xxxxxxxxxxxxxxxxxxxxxxxx")
+    colA, colB = st.columns([1,1])
+    with colA:
+        start_btn = st.button("🚀 Escanear PDFs", type="primary", use_container_width=True)
+    with colB:
+        st.write(" ")
+    results_df = pd.DataFrame()
+    if start_btn:
+        folder_id = parse_folder_id_from_input(folder_input)
+        if not folder_id:
+            st.error("No pude detectar el **ID** de carpeta. Verifica la URL/ID que pegaste.")
+        else:
+            with st.spinner("Autenticando con Google Drive..."):
+                try:
+                    drive = gauth_login()
+                except Exception as e:
+                    st.exception(e)
+                    st.stop()
+            with st.spinner("Listando PDFs en la carpeta..."):
+                try:
+                    files = list_pdfs_in_folder(drive, folder_id)
+                except Exception as e:
+                    st.exception(e)
+                    st.stop()
+            if not files:
+                st.warning("No se encontraron PDFs en esa carpeta.")
+            else:
+                st.success(f"Encontrados {len(files)} PDFs. Empezando escaneo…")
+                prog = st.progress(0)
+                rows = []
+                for i, meta in enumerate(files, start=1):
+                    try:
+                        tmp_pdf = download_pdf_to_temp(drive, meta["id"])
+                        text = extract_text_from_pdf_file(tmp_pdf)
+                        if "venta dm" not in normalize_text(text).lower():
+                            try: os.remove(tmp_pdf)
+                            except: pass
+                            prog.progress(i/len(files))
+                            continue
+                        venta_dm, folio = extract_fields_from_text(text)
+                        rows.append({"archivo": meta["title"], "venta_dm": venta_dm, "folio": folio})
+                        try: os.remove(tmp_pdf)
+                        except: pass
+                    except Exception:
+                        rows.append({"archivo": meta.get("title","(desconocido)"), "venta_dm": "", "folio": ""})
+                    prog.progress(i/len(files))
+                results_df = pd.DataFrame(rows)
+                if results_df.empty:
+                    st.warning("Se escanearon los PDFs, pero **ninguno** contenía la frase 'Venta DM'.")
+                else:
+                    st.success("Listo. Resultados:")
+                    st.dataframe(results_df, use_container_width=True, height=400)
+                    out = io.BytesIO()
+                    with pd.ExcelWriter(out, engine="openpyxl") as writer:
+                        results_df.to_excel(writer, index=False, sheet_name="Resultados")
+                    st.download_button("⬇️ Descargar Excel", data=out.getvalue(), file_name="venta_dm_folios.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", use_container_width=True)
+
+with tab2:
+    st.write("Si prefieres, sube PDFs manualmente (no usa Google Drive).")
+    up_files = st.file_uploader("Sube uno o más PDFs", type=["pdf"], accept_multiple_files=True)
+    if up_files:
+        rows = []
+        for f in up_files:
+            try:
+                fd, tmp_path = tempfile.mkstemp(suffix=".pdf")
+                os.close(fd)
+                with open(tmp_path, "wb") as fh:
+                    fh.write(f.read())
+                text = extract_text_from_pdf_file(tmp_path)
+                if "venta dm" not in normalize_text(text).lower():
+                    os.remove(tmp_path)
+                    continue
+                venta_dm, folio = extract_fields_from_text(text)
+                rows.append({"archivo": f.name, "venta_dm": venta_dm, "folio": folio})
+                os.remove(tmp_path)
+            except Exception:
+                rows.append({"archivo": f.name, "venta_dm": "", "folio": ""})
+        if rows:
+            up_df = pd.DataFrame(rows)
+            st.dataframe(up_df, use_container_width=True, height=350)
+            out2 = io.BytesIO()
+            with pd.ExcelWriter(out2, engine="openpyxl") as writer:
+                up_df.to_excel(writer, index=False, sheet_name="Resultados")
+            st.download_button("⬇️ Descargar Excel (subidos)", data=out2.getvalue(), file_name="venta_dm_folios_subidos.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", use_container_width=True)
+        else:
+            st.info("Sube archivos PDF para procesar.")
