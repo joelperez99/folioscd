@@ -7,7 +7,7 @@ from typing import List, Tuple, Dict
 import pandas as pd
 import streamlit as st
 from unidecode import unidecode
-from pdfminer.high_level import extract_text
+from pdfminer_high_level import extract_text  # si usas import diferido, puedes revertir a from pdfminer.high_level ...
 
 from pydrive2.auth import GoogleAuth
 from pydrive2.drive import GoogleDrive
@@ -17,10 +17,18 @@ st.title("📄 Escáner de PDFs en Google Drive → Venta DM & FOLIO")
 st.caption("Pega la URL/ID de la carpeta de Drive, escanea los PDFs y descarga un Excel.")
 
 # --------------------- Helpers de parsing ---------------------
+# 1) Patrones específicos para Shopify (capturan números cortos después de 'Shopify')
+# 2) Patrones genéricos para Mercado Libre / otros (números largos)
 VENTA_DM_REGEXES = [
+    # Ej.: "Venta DM Shopify - 4368" / "Venta DM ... Shopify: 1234"
+    r"venta\s*dm[^a-z0-9]{0,30}shopify[^0-9]{0,30}[-:]\s*([0-9]{3,})",
+    r"shopify[^0-9]{0,30}[-:]\s*([0-9]{3,})",
+
+    # Genéricos (ML u otros, números largos)
     r"venta\s*dm[^\d]{0,30}[-:]\s*([0-9]{6,})",
     r"venta\s*dm[^\d]{0,30}\s+([0-9]{6,})",
 ]
+
 FOLIO_REGEXES = [
     r"folio\s*[:\-]\s*([A-Z0-9\-\/]{3,})",
     r"\bfolio\b\s+([A-Z0-9\-\/]{3,})",
@@ -32,18 +40,22 @@ def normalize_text(txt: str) -> str:
     return t
 
 def extract_fields_from_text(text: str) -> Tuple[str, str]:
+    """Devuelve (venta_dm, folio). Soporta 'Venta DM Shopify - 4368' y casos ML."""
     t = normalize_text(text).lower()
     venta_dm, folio = "", ""
+
     for pat in VENTA_DM_REGEXES:
         m = re.search(pat, t, flags=re.IGNORECASE | re.DOTALL)
         if m:
             venta_dm = m.group(1).strip()
             break
+
     for pat in FOLIO_REGEXES:
         m = re.search(pat, t, flags=re.IGNORECASE | re.DOTALL)
         if m:
             folio = m.group(1).strip().strip(".;,")
             break
+
     return venta_dm, folio
 
 def parse_folder_id_from_input(folder_input: str) -> str:
@@ -72,7 +84,6 @@ with st.expander("Abrir configuración", expanded=True):
         save_btn = st.button("💾 Guardar en sesión (no persiste en disco)", use_container_width=True)
 
         if save_btn:
-            # Validación rápida que sea JSON válido y que tenga client_email
             try:
                 parsed = json.loads(sa_json_text)
                 assert "client_email" in parsed, "Falta 'client_email' en el JSON"
@@ -83,7 +94,6 @@ with st.expander("Abrir configuración", expanded=True):
                 st.error(f"JSON inválido: {e}")
 
     with colB:
-        # Mostrar estado de origen del secreto
         from_secrets = st.secrets.get("GDRIVE_SERVICE_JSON", None) is not None
         from_session = "sa_json_parsed" in st.session_state
 
@@ -101,8 +111,6 @@ with st.expander("Abrir configuración", expanded=True):
 
         if test_btn:
             try:
-                drv = None
-                # Prioridad: Secrets → Sesión
                 if from_secrets:
                     sa_json_obj = st.secrets["GDRIVE_SERVICE_JSON"]
                 elif from_session:
@@ -112,7 +120,6 @@ with st.expander("Abrir configuración", expanded=True):
                         "No hay credenciales. Usa *Secrets* o pega el JSON y presiona “Guardar en sesión”."
                     )
 
-                # Guardamos a archivo temporal para pydrive2
                 sa_path = "service_account.json"
                 with open(sa_path, "w", encoding="utf-8") as f:
                     f.write(json.dumps(sa_json_obj) if isinstance(sa_json_obj, dict) else sa_json_obj)
@@ -122,7 +129,7 @@ with st.expander("Abrir configuración", expanded=True):
                     "service_config": {"client_json_file_path": sa_path}
                 })
                 gauth.ServiceAuth()
-                drv = GoogleDrive(gauth)
+                GoogleDrive(gauth)
                 st.success("Autenticación correcta ✅. Ya puedes escanear la carpeta.")
                 st.caption(f"Cuenta: { (sa_json_obj.get('client_email') if isinstance(sa_json_obj, dict) else '') }")
             except Exception as e:
@@ -130,7 +137,6 @@ with st.expander("Abrir configuración", expanded=True):
 
 # --------------------- Autenticación centralizada ---------------------
 def get_drive() -> GoogleDrive:
-    """Usa Secrets si existen; si no, usa el JSON pegado en la UI. Si no hay, se detiene."""
     sa_json_obj = None
     if st.secrets.get("GDRIVE_SERVICE_JSON", None):
         sa_json_obj = st.secrets["GDRIVE_SERVICE_JSON"]
@@ -202,10 +208,13 @@ with tab1:
                 try:
                     tmp_pdf = download_pdf_temp(drive, meta["id"])
                     text = extract_text_from_pdf(tmp_pdf)
-                    if "venta dm" not in normalize_text(text).lower():
-                        os.remove(tmp_pdf)
-                        prog.progress(i/len(files))
-                        continue
+
+                    # Antes: solo validábamos 'venta dm'. Ahora Shopify también cae,
+                    # porque la frase típica incluye 'venta dm'; mantenemos esta verificación
+                    # para evitar procesar PDFs irrelevantes.
+                    if "venta dm" not in normalize_text(text).lower() and "shopify" not in normalize_text(text).lower():
+                        os.remove(tmp_pdf); prog.progress(i/len(files)); continue
+
                     venta_dm, folio = extract_fields_from_text(text)
                     rows.append({"archivo": meta["title"], "venta_dm": venta_dm, "folio": folio})
                     os.remove(tmp_pdf)
@@ -215,7 +224,7 @@ with tab1:
 
             df = pd.DataFrame(rows)
             if df.empty:
-                st.warning("Se escanearon los PDFs pero ninguno contenía 'Venta DM'.")
+                st.warning("Se escanearon los PDFs pero ninguno contenía 'Venta DM' / 'Shopify'.")
             else:
                 st.dataframe(df, use_container_width=True, height=420)
                 out = io.BytesIO()
@@ -239,7 +248,7 @@ with tab2:
                 fd, tmp = tempfile.mkstemp(suffix=".pdf"); os.close(fd)
                 with open(tmp, "wb") as h: h.write(f.read())
                 text = extract_text_from_pdf(tmp)
-                if "venta dm" in normalize_text(text).lower():
+                if ("venta dm" in normalize_text(text).lower()) or ("shopify" in normalize_text(text).lower()):
                     venta_dm, folio = extract_fields_from_text(text)
                     rows.append({"archivo": f.name, "venta_dm": venta_dm, "folio": folio})
                 os.remove(tmp)
